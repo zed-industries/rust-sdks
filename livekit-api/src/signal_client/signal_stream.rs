@@ -18,7 +18,7 @@ use futures_util::{
 };
 use livekit_protocol as proto;
 use livekit_runtime::{JoinHandle, TcpStream};
-use prost::Message as ProtoMessage;
+use prost::{bytes::Bytes, Message as ProtoMessage};
 use std::{env, io};
 
 use tokio::sync::{mpsc, oneshot};
@@ -64,7 +64,7 @@ enum InternalMessage {
         response_chn: oneshot::Sender<SignalResult<()>>,
     },
     Pong {
-        ping_data: Vec<u8>,
+        ping_data: Bytes,
     },
     Close,
 }
@@ -91,7 +91,7 @@ impl SignalStream {
         tls_connector: Option<Connector>,
     ) -> SignalResult<(Self, mpsc::UnboundedReceiver<Box<proto::signal_response::Message>>)> {
         log::info!("connecting to {}", url);
-        let mut request = url.clone().into_client_request()?;
+        let mut request = url.clone().as_str().into_client_request()?;
         let auth_header = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| SignalError::TokenFormat)?;
         request.headers_mut().insert(AUTHORIZATION, auth_header);
@@ -215,6 +215,8 @@ impl SignalStream {
                         #[cfg(feature = "rustls-tls-native-roots")]
                         {
                             // For WSS, we need to establish TLS over the proxy connection
+                            use rustls::pki_types::CertificateDer;
+                            use rustls_native_certs::Certificate;
                             use std::sync::Arc;
                             use tokio_rustls::{rustls, TlsConnector};
 
@@ -222,21 +224,21 @@ impl SignalStream {
                             let mut root_store = rustls::RootCertStore::empty();
                             match rustls_native_certs::load_native_certs() {
                                 Ok(certs) => {
-                                    let roots: Vec<rustls::Certificate> = certs
-                                        .into_iter()
-                                        .map(|cert| rustls::Certificate(cert.0))
-                                        .collect();
+                                    let roots: Vec<Certificate> =
+                                        certs.into_iter().map(|cert| Certificate(cert.0)).collect();
 
                                     for root in roots {
-                                        root_store.add(&root).map_err(|e| {
-                                            WsError::Io(io::Error::new(
-                                                io::ErrorKind::Other,
-                                                format!(
-                                                    "Failed to parse root certificate: {:?}",
-                                                    e
-                                                ),
-                                            ))
-                                        })?;
+                                        root_store
+                                            .add(CertificateDer::from_slice(&root.0))
+                                            .map_err(|e| {
+                                                WsError::Io(io::Error::new(
+                                                    io::ErrorKind::Other,
+                                                    format!(
+                                                        "Failed to parse root certificate: {:?}",
+                                                        e
+                                                    ),
+                                                ))
+                                            })?;
                                     }
                                 }
                                 Err(e) => {
@@ -249,11 +251,13 @@ impl SignalStream {
                             }
 
                             let tls_config = rustls::ClientConfig::builder()
-                                .with_safe_defaults()
                                 .with_root_certificates(root_store)
                                 .with_no_client_auth();
 
-                            let server_name = rustls::ServerName::try_from(host).map_err(|_| {
+                            let server_name = rustls::pki_types::ServerName::try_from(
+                                host.to_string(),
+                            )
+                            .map_err(|_| {
                                 WsError::Io(io::Error::new(
                                     io::ErrorKind::InvalidInput,
                                     format!("Invalid DNS name: {}", host),
@@ -353,7 +357,7 @@ impl SignalStream {
                 InternalMessage::Signal { signal, response_chn } => {
                     let data = proto::SignalRequest { message: Some(signal) }.encode_to_vec();
 
-                    if let Err(err) = ws_writer.send(Message::Binary(data)).await {
+                    if let Err(err) = ws_writer.send(Message::Binary(data.into())).await {
                         let _ = response_chn.send(Err(err.into()));
                         break;
                     }
@@ -361,7 +365,7 @@ impl SignalStream {
                     let _ = response_chn.send(Ok(()));
                 }
                 InternalMessage::Pong { ping_data } => {
-                    if let Err(err) = ws_writer.send(Message::Pong(ping_data)).await {
+                    if let Err(err) = ws_writer.send(Message::Pong(ping_data.into())).await {
                         log::error!("failed to send pong message: {:?}", err);
                     }
                 }
@@ -384,7 +388,7 @@ impl SignalStream {
         while let Some(msg) = ws_reader.next().await {
             match msg {
                 Ok(Message::Binary(data)) => {
-                    let res = proto::SignalResponse::decode(data.as_slice())
+                    let res = proto::SignalResponse::decode(Bytes::from(data))
                         .expect("failed to decode SignalResponse");
 
                     if let Some(msg) = res.message {
@@ -392,7 +396,8 @@ impl SignalStream {
                     }
                 }
                 Ok(Message::Ping(data)) => {
-                    let _ = internal_tx.send(InternalMessage::Pong { ping_data: data }).await;
+                    let _ =
+                        internal_tx.send(InternalMessage::Pong { ping_data: data.into() }).await;
                     continue;
                 }
                 Ok(Message::Close(close)) => {
